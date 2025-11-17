@@ -1,0 +1,66 @@
+#############################################
+# STM32CubeIDE / Eclipse Build Artifacts
+#############################################
+
+# Ignore Debug/Release folders in ALL subprojects
+**/Debug/
+**/Release/
+**/build/
+
+# Build output files
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+#############################################
+# STM32CubeIDE Project Metadata
+#############################################
+
+# Language settings (machine-specific)
+**/.settings/language.settings.xml
+
+# Other volatile Eclipse/CubeIDE settings
+**/.settings/*.prefs
+**/.settings/*.tmp
+
+**/*.launch
+
+# If you prefer to ignore the entire settings folder:
+# **/.settings/
+
+#############################################
+# Workspace metadata (never include)
+#############################################
+
+# Eclipse/CubeIDE user workspace stuff
+.metadata/
+**/.metadata/
+
+# Misc Eclipse artifacts
+.loadpath
+.autotools
+.externalToolBuilders/
+
+#############################################
+# Temporary / generated files
+#############################################
+
+*.log
+*.tmp
+
+#############################################
+# OS / Editor specific
+#############################################
+
+# VSCode
+.vscode/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
