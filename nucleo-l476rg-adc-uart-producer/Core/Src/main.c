@@ -52,22 +52,26 @@ DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
 // DMA Buffer for ADC sampling (circular buffer)
-#define BUFFER_SIZE 2000      // Total buffer: 2000 samples (200ms at 10kHz)
-#define HALF_BUFFER_SIZE 1000 // Half buffer: 1000 samples (100ms at 10kHz)
+#define BUFFER_SIZE                                                            \
+  2000 // Total buffer: 2000 samples (200ms at 10kHz dual-channel)
+#define HALF_BUFFER_SIZE                                                       \
+  1000 // Half buffer: 1000 samples (100ms at 10kHz dual-channel)
 
-uint16_t adc_buffer[BUFFER_SIZE]; // Circular buffer filled by DMA
+uint32_t adc_buffer[BUFFER_SIZE]; // Circular buffer filled by DMA (32-bit for
+                                  // dual ADC!)
 volatile uint8_t buffer_half_ready =
     0; // 0=none, 1=first half ready, 2=second half ready
 volatile uint8_t uart_tx_busy = 0; // 0=idle, 1=transmission in progress
 
-// Packet structure for UART transmission
+// Packet structure for UART transmission (dual-channel)
 typedef struct {
-  uint16_t start_marker;               // 0xAA55 - synchronization marker
-  uint16_t sequence_number;            // Packet counter (0-65535, wraps around)
-  uint16_t sample_count;               // Number of ADC samples in this packet
-  uint16_t adc_data[HALF_BUFFER_SIZE]; // ADC samples (1000 values)
-  uint16_t checksum;                   // CRC16 for integrity validation
-  uint16_t end_marker;                 // 0x55AA - end of packet marker
+  uint16_t start_marker;    // 0xAA55 - synchronization marker
+  uint16_t sequence_number; // Packet counter (0-65535, wraps around)
+  uint16_t sample_count;    // Number of samples per channel in this packet
+  uint16_t voltage_data[HALF_BUFFER_SIZE]; // ADC1 samples (1000 values) - PA0
+  uint16_t current_data[HALF_BUFFER_SIZE]; // ADC2 samples (1000 values) - PA1
+  uint16_t checksum;                       // CRC16 for integrity validation
+  uint16_t end_marker;                     // 0x55AA - end of packet marker
 } __attribute__((packed)) ADCPacket;
 
 // Global variables for packet transmission
@@ -124,12 +128,12 @@ uint16_t calculate_crc16(uint16_t *data, uint16_t count) {
 }
 
 /**
- * @brief  Build packet and transmit ADC buffer via UART with DMA
- * @param  data: Pointer to ADC data buffer
- * @param  size: Number of samples to transmit
+ * @brief  Build packet and transmit dual ADC buffer via UART with DMA
+ * @param  data: Pointer to dual ADC data buffer (32-bit packed words)
+ * @param  size: Number of samples to transmit per channel
  * @retval None
  */
-void transmit_buffer_uart(uint16_t *data, uint16_t size) {
+void transmit_buffer_uart(uint32_t *data, uint16_t size) {
   if (uart_tx_busy) {
     // UART transmission already in progress - skip this buffer
     // In production, might want to log this as a data loss event
@@ -139,18 +143,26 @@ void transmit_buffer_uart(uint16_t *data, uint16_t size) {
   // Build packet header
   tx_packet.start_marker = 0xAA55; // Sync pattern for packet detection
   tx_packet.sequence_number = packet_sequence++; // Increment packet counter
-  tx_packet.sample_count = size;                 // Number of samples
+  tx_packet.sample_count = size; // Number of samples per channel
 
-  // Copy ADC data from DMA buffer to transmit packet
-  memcpy(tx_packet.adc_data, data, size * sizeof(uint16_t));
+  // Unpack 32-bit dual ADC data into separate voltage and current arrays
+  // Each 32-bit word contains: [ADC2_current(31:16) | ADC1_voltage(15:0)]
+  for (uint16_t i = 0; i < size; i++) {
+    tx_packet.voltage_data[i] =
+        (uint16_t)(data[i] & 0xFFFF); // Lower 16 bits = ADC1 (voltage)
+    tx_packet.current_data[i] =
+        (uint16_t)((data[i] >> 16) & 0xFFFF); // Upper 16 bits = ADC2 (current)
+  }
 
-  // Calculate CRC16 checksum over: sequence_number + sample_count + adc_data
-  // Use byte pointer to avoid alignment warning with packed struct
+  // Calculate CRC16 checksum over: sequence_number + sample_count +
+  // voltage_data + current_data Use byte pointer to avoid alignment warning
+  // with packed struct
   uint8_t *checksum_data_bytes = (uint8_t *)&tx_packet.sequence_number;
   uint16_t checksum_byte_count =
-      (1 + 1 + size) * 2; // (seq + count + samples) * 2 bytes per word
+      (1 + 1 + size + size) *
+      2; // (seq + count + voltage_samples + current_samples) * 2 bytes per word
 
-  // Calculate CRC on bytes, then convert back to uint16_t format for function
+  // Calculate CRC on bytes for dual-channel data
   uint16_t crc = 0xFFFF;
   for (uint16_t i = 0; i < checksum_byte_count; i++) {
     crc ^= checksum_data_bytes[i];
@@ -167,31 +179,34 @@ void transmit_buffer_uart(uint16_t *data, uint16_t size) {
   // Add end marker
   tx_packet.end_marker = 0x55AA; // Different from start for validation
 
-  // Calculate total packet size in bytes
+  // Calculate total packet size in bytes for dual-channel
   // Header: start(2) + seq(2) + count(2) = 6 bytes
-  // Data: size * 2 bytes
+  // Data: voltage_data (size * 2) + current_data (size * 2) bytes
   // Trailer: checksum(2) + end(2) = 4 bytes
-  uint16_t packet_size = 6 + (size * 2) + 4;
+  uint16_t packet_size = 6 + (size * 2 * 2) + 4;
 
-  // Force UART state to READY before DMA transmission (workaround for callback
-  // issue)
-  if (huart2.gState != HAL_UART_STATE_READY) {
-    huart2.gState = HAL_UART_STATE_READY;
+  // Use blocking UART transmission (reliable, proven to work)
+  // Note: Blocks CPU for ~44ms, but still leaves 56ms free in 100ms cycle
+  // For production DMA: would require proper USART2_TX DMA configuration in
+  // CubeMX
+  uart_tx_busy = 1;
+  HAL_StatusTypeDef status =
+      HAL_UART_Transmit(&huart2, (uint8_t *)&tx_packet, packet_size, 100);
+  uart_tx_busy = 0; // Clear immediately after blocking send
+
+  if (status != HAL_OK) {
+    // Transmission failed - indicate error with LED
+    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
   }
-
-  // Start non-blocking UART transmission via DMA
-  uart_tx_busy = 1; // Set flag before starting transmission
-  HAL_UART_Transmit_DMA(&huart2, (uint8_t *)&tx_packet, packet_size);
 }
 
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
 
   /* USER CODE BEGIN 1 */
 
@@ -199,7 +214,8 @@ int main(void)
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
+   */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -224,23 +240,20 @@ int main(void)
   MX_TIM6_Init();
   MX_ADC2_Init();
   /* USER CODE BEGIN 2 */
-  // Calibrate ADC for accurate measurements (required before first use)
+  // Calibrate both ADCs for accurate measurements (required before first use)
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
   // Initialize watchdog timer to prevent immediate trigger
   last_callback_time = HAL_GetTick();
 
-  // Start ADC with DMA in circular mode
-  HAL_StatusTypeDef adc_status =
-      HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, BUFFER_SIZE);
+  // Start timer BEFORE ADC (ADC needs timer trigger)
+  HAL_TIM_Base_Start(&htim6);
 
-  // Diagnostic: Blink LED 3 times at startup to show system is running
-  for (int i = 0; i < 3; i++) {
-    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-    HAL_Delay(100);
-    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-    HAL_Delay(100);
-  }
+  // Start DUAL ADC with DMA in circular mode
+  // Use MultiModeStart for dual simultaneous ADC
+  HAL_StatusTypeDef adc_status =
+      HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_buffer, BUFFER_SIZE);
 
   // If ADC start failed, blink LED very fast continuously
   if (adc_status != HAL_OK) {
@@ -252,9 +265,6 @@ int main(void)
     }
   }
 
-  // Start timer to trigger ADC conversions at 10kHz
-  HAL_TIM_Base_Start(&htim6);
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -264,14 +274,14 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    // WORKAROUND: Poll DMA transfer status directly (callbacks may not fire
-    // reliably)
+    // Poll DMA transfer status (callbacks may not fire reliably)
     static uint32_t last_poll_time = 0;
     static uint32_t last_tx_time = 0;
     uint32_t current_time = HAL_GetTick();
 
-    // Force clear uart_tx_busy if UART callback didn't fire after 50ms
-    if (uart_tx_busy && (current_time - last_tx_time > 50)) {
+    // Force clear uart_tx_busy safety timeout
+    // (Not needed for blocking mode, but kept for consistency)
+    if (uart_tx_busy && (current_time - last_tx_time > 100)) {
       uart_tx_busy = 0;
     }
 
@@ -299,42 +309,36 @@ int main(void)
       transmit_buffer_uart(&adc_buffer[0], HALF_BUFFER_SIZE);
       buffer_half_ready = 0;
       last_tx_time = current_time;
-
-      // LED blink to show transmission
-      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin); // LED indicates activity
     }
     // Check if second half of buffer is ready and UART is available
     else if (buffer_half_ready == 2 && !uart_tx_busy) {
       transmit_buffer_uart(&adc_buffer[HALF_BUFFER_SIZE], HALF_BUFFER_SIZE);
       buffer_half_ready = 0;
       last_tx_time = current_time;
-
-      // LED blink to show transmission
-      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin); // LED indicates activity
     }
   }
   /* USER CODE END 3 */
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-  */
-  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
-  {
+   */
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK) {
     Error_Handler();
   }
 
   /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
+   * in the RCC_OscInitTypeDef structure.
+   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -345,36 +349,33 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+   */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-  {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
     Error_Handler();
   }
 }
 
 /**
-  * @brief Peripherals Common Clock Configuration
-  * @retval None
-  */
-void PeriphCommonClock_Config(void)
-{
+ * @brief Peripherals Common Clock Configuration
+ * @retval None
+ */
+void PeriphCommonClock_Config(void) {
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the peripherals clock
-  */
+   */
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
   PeriphClkInit.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
   PeriphClkInit.PLLSAI1.PLLSAI1Source = RCC_PLLSOURCE_HSI;
@@ -384,19 +385,17 @@ void PeriphCommonClock_Config(void)
   PeriphClkInit.PLLSAI1.PLLSAI1Q = RCC_PLLQ_DIV2;
   PeriphClkInit.PLLSAI1.PLLSAI1R = RCC_PLLR_DIV2;
   PeriphClkInit.PLLSAI1.PLLSAI1ClockOut = RCC_PLLSAI1_ADC1CLK;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
-  {
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) {
     Error_Handler();
   }
 }
 
 /**
-  * @brief ADC1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC1_Init(void)
-{
+ * @brief ADC1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_ADC1_Init(void) {
 
   /* USER CODE BEGIN ADC1_Init 0 */
 
@@ -410,7 +409,7 @@ static void MX_ADC1_Init(void)
   /* USER CODE END ADC1_Init 1 */
 
   /** Common config
-  */
+   */
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
@@ -426,46 +425,41 @@ static void MX_ADC1_Init(void)
   hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.OversamplingMode = DISABLE;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
+  if (HAL_ADC_Init(&hadc1) != HAL_OK) {
     Error_Handler();
   }
 
   /** Configure the ADC multi-mode
-  */
+   */
   multimode.Mode = ADC_DUALMODE_REGSIMULT;
   multimode.DMAAccessMode = ADC_DMAACCESSMODE_12_10_BITS;
   multimode.TwoSamplingDelay = ADC_TWOSAMPLINGDELAY_1CYCLE;
-  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
-  {
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK) {
     Error_Handler();
   }
 
   /** Configure Regular Channel
-  */
+   */
   sConfig.Channel = ADC_CHANNEL_5;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
-
 }
 
 /**
-  * @brief ADC2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC2_Init(void)
-{
+ * @brief ADC2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_ADC2_Init(void) {
 
   /* USER CODE BEGIN ADC2_Init 0 */
 
@@ -478,7 +472,7 @@ static void MX_ADC2_Init(void)
   /* USER CODE END ADC2_Init 1 */
 
   /** Common config
-  */
+   */
   hadc2.Instance = ADC2;
   hadc2.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV4;
   hadc2.Init.Resolution = ADC_RESOLUTION_12B;
@@ -492,36 +486,32 @@ static void MX_ADC2_Init(void)
   hadc2.Init.DMAContinuousRequests = DISABLE;
   hadc2.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc2.Init.OversamplingMode = DISABLE;
-  if (HAL_ADC_Init(&hadc2) != HAL_OK)
-  {
+  if (HAL_ADC_Init(&hadc2) != HAL_OK) {
     Error_Handler();
   }
 
   /** Configure Regular Channel
-  */
+   */
   sConfig.Channel = ADC_CHANNEL_6;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
-  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
-  {
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN ADC2_Init 2 */
 
   /* USER CODE END ADC2_Init 2 */
-
 }
 
 /**
-  * @brief TIM6 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM6_Init(void)
-{
+ * @brief TIM6 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM6_Init(void) {
 
   /* USER CODE BEGIN TIM6_Init 0 */
 
@@ -537,29 +527,25 @@ static void MX_TIM6_Init(void)
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim6.Init.Period = 999;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
-  {
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
     Error_Handler();
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
-  {
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM6_Init 2 */
 
   /* USER CODE END TIM6_Init 2 */
-
 }
 
 /**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
+ * @brief USART2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART2_UART_Init(void) {
 
   /* USER CODE BEGIN USART2_Init 0 */
 
@@ -578,21 +564,18 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
+  if (HAL_UART_Init(&huart2) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
-
 }
 
 /**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
+ * Enable DMA controller clock
+ */
+static void MX_DMA_Init(void) {
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
@@ -604,16 +587,14 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel7_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
-
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
@@ -705,10 +686,10 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc) {
   if (hadc->Instance == ADC1) {
     error_count++;
 
-    // Attempt to restart ADC
-    HAL_ADC_Stop_DMA(&hadc1);
+    // Attempt to restart DUAL ADC (use MultiMode for dual ADC)
+    HAL_ADCEx_MultiModeStop_DMA(&hadc1);
     HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, BUFFER_SIZE);
+    HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_buffer, BUFFER_SIZE);
 
     // Reset watchdog
     last_callback_time = HAL_GetTick();
@@ -718,11 +699,10 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc) {
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
@@ -732,14 +712,13 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line) {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
