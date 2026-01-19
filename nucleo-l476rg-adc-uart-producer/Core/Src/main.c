@@ -51,24 +51,46 @@ UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
-#define BUFFER_SIZE 2000
-#define HALF_BUFFER_SIZE 1000
+#define BUFFER_SIZE 2000      // 200ms at 10kHz (IEC 61000-4-7 compliant)
+#define HALF_BUFFER_SIZE 1000 // 100ms per packet
 
+/**
+ * UART Packet Structure (4010 bytes total)
+ *
+ * All fields are uint16_t for natural 2-byte alignment.
+ * NO __attribute__((packed)) needed - compiler adds no padding because
+ * all fields are same size (uint16_t = 2 bytes).
+ *
+ * Memory layout is naturally compact:
+ * - Each uint16_t at even address (0, 2, 4, 6, ...)
+ * - No gaps between fields
+ * - Total size: 2+2+2+2000+2000+2+2 = 4010 bytes
+ */
 typedef struct {
-  uint16_t start_marker;
-  uint16_t sequence;
-  uint16_t count;
-  uint16_t voltage_data[HALF_BUFFER_SIZE];
-  uint16_t current_data[HALF_BUFFER_SIZE];
-  uint16_t checksum;
-  uint16_t end_marker;
+  uint16_t start_marker;                   // 0xFFFF
+  uint16_t sequence;                       // Packet counter (0-65535, wraps)
+  uint16_t count;                          // Samples per channel (always 1000)
+  uint16_t voltage_data[HALF_BUFFER_SIZE]; // ADC1 voltage samples
+  uint16_t current_data[HALF_BUFFER_SIZE]; // ADC2 current samples
+  uint16_t checksum;                       // CRC16-MODBUS
+  uint16_t end_marker;                     // 0xFFFE
 } PacketData;
 
-uint32_t adc_buffer[BUFFER_SIZE];
+uint32_t adc_buffer[BUFFER_SIZE]; // Dual ADC: [I(31:16)|V(15:0)]
 volatile uint8_t buffer_half_ready = 0;
 volatile uint8_t uart_tx_busy = 0;
 
 static uint16_t packet_sequence = 0;
+/**
+ * Packet buffer with 4-byte alignment for DMA compatibility.
+ *
+ * __attribute__((aligned(4))) ensures struct starts at address
+ * that is multiple of 4 (required by STM32 DMA controller).
+ *
+ * Applied to VARIABLE, not struct type definition, because:
+ * - Struct fields are naturally aligned (all uint16_t)
+ * - Only need to align the starting address for DMA
+ */
 static PacketData tx_packet __attribute__((aligned(4)));
 /* USER CODE END PV */
 
@@ -93,7 +115,7 @@ void transmit_buffer_uart(uint32_t *data, uint16_t size) {
     return;
   }
 
-  tx_packet.start_marker = 0xAA55;
+  tx_packet.start_marker = 0xFFFF;
   tx_packet.sequence = packet_sequence++;
   tx_packet.count = size;
 
@@ -119,7 +141,7 @@ void transmit_buffer_uart(uint32_t *data, uint16_t size) {
   }
 
   tx_packet.checksum = crc;
-  tx_packet.end_marker = 0x55AA;
+  tx_packet.end_marker = 0xFFFE;
 
   uart_tx_busy = 1;
   __DSB();

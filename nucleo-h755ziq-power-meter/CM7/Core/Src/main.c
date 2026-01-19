@@ -76,13 +76,13 @@
  * - Total size: 2+2+2+2000+2000+2+2 = 4010 bytes
  */
 typedef struct {
-  uint16_t start_marker;                   // 0xAA55
+  uint16_t start_marker;                   // 0xFFFF
   uint16_t sequence;                       // Packet counter (0-65535, wraps)
   uint16_t count;                          // Samples per channel (always 1000)
   uint16_t voltage_data[HALF_BUFFER_SIZE]; // ADC1 voltage samples
   uint16_t current_data[HALF_BUFFER_SIZE]; // ADC2 current samples
   uint16_t checksum;                       // CRC16-MODBUS
-  uint16_t end_marker;                     // 0x55AA
+  uint16_t end_marker;                     // 0xFFFE
 } PacketData;
 
 // DMA buffers in D2 SRAM (0x30000000) - NOT cacheable, no MPU needed!
@@ -113,7 +113,7 @@ void transmit_buffer_uart(uint32_t *data, uint16_t size) {
     return;
   }
 
-  tx_packet.start_marker = 0xAA55;
+  tx_packet.start_marker = 0xFFFF;
   tx_packet.sequence = packet_sequence++;
   tx_packet.count = size;
 
@@ -139,7 +139,7 @@ void transmit_buffer_uart(uint32_t *data, uint16_t size) {
   }
 
   tx_packet.checksum = crc;
-  tx_packet.end_marker = 0x55AA;
+  tx_packet.end_marker = 0xFFFE;
 
   uart_tx_busy = 1;
   HAL_StatusTypeDef status =
