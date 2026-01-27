@@ -60,8 +60,10 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-#define BUFFER_SIZE 2000      // 200ms at 10kHz (IEC 61000-4-7 compliant)
-#define HALF_BUFFER_SIZE 1000 // 100ms per packet
+#define BUFFER_SIZE                                                            \
+  2048 // 200ms at 10.24kHz (IEC 61000-4-7 perfect FFT window: 2^11)
+#define HALF_BUFFER_SIZE                                                       \
+  1024 // 100ms per packet (power-of-2 for efficient processing)
 
 /**
  * UART Packet Structure (4010 bytes total)
