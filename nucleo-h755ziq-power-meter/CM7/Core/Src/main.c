@@ -81,6 +81,7 @@ typedef struct {
   uint16_t start_marker;                   // 0xFFFF
   uint16_t sequence;                       // Packet counter (0-65535, wraps)
   uint16_t count;                          // Samples per channel (always 1000)
+  uint16_t vref_mv;                        // VDDA voltage in millivolts (from VREFINT)
   uint16_t voltage_data[HALF_BUFFER_SIZE]; // ADC1 voltage samples
   uint16_t current_data[HALF_BUFFER_SIZE]; // ADC2 current samples
   uint16_t checksum;                       // CRC16-MODBUS
@@ -98,6 +99,9 @@ volatile uint8_t buffer_half_ready = 0;
 volatile uint8_t uart_tx_busy = 0;
 
 static uint16_t packet_sequence = 0;
+
+// VREFINT calibration - addresses defined in stm32h7xx_ll_adc.h
+static volatile uint16_t vdda_mv = 3300;  // Default to 3.3V, updated by VREFINT reading
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -118,6 +122,7 @@ void transmit_buffer_uart(uint32_t *data, uint16_t size) {
   tx_packet.start_marker = 0xFFFF;
   tx_packet.sequence = packet_sequence++;
   tx_packet.count = size;
+  tx_packet.vref_mv = vdda_mv;  // Include calibrated VDDA voltage
 
   for (uint16_t i = 0; i < size; i++) {
     tx_packet.voltage_data[i] = (uint16_t)(data[i] & 0xFFFF);
@@ -126,6 +131,7 @@ void transmit_buffer_uart(uint32_t *data, uint16_t size) {
 
   uint8_t *crc_start = (uint8_t *)&tx_packet.sequence;
   uint16_t crc_length = sizeof(tx_packet.sequence) + sizeof(tx_packet.count) +
+                        sizeof(tx_packet.vref_mv) +
                         sizeof(tx_packet.voltage_data) +
                         sizeof(tx_packet.current_data);
   uint16_t crc = 0xFFFF;
@@ -227,6 +233,7 @@ int main(void) {
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
+  MX_ADC3_Init();
   MX_TIM6_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
@@ -234,6 +241,7 @@ int main(void) {
   // Calibrate ADCs (H7 needs calibration like L4)
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
+  HAL_ADCEx_Calibration_Start(&hadc3, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
 
   // Clear buffer before starting to verify ADC is actually writing new data
   for (int i = 0; i < BUFFER_SIZE; i++) {
@@ -265,7 +273,27 @@ int main(void) {
 
     /* USER CODE BEGIN 3 */
     static uint32_t last_tx_time = 0;
+    static uint32_t last_vrefint_time = 0;
     uint32_t current_time = HAL_GetTick();
+
+    // Read VREFINT once per second for VDDA calibration
+    if (current_time - last_vrefint_time >= 1000) {
+      last_vrefint_time = current_time;
+
+      // Start ADC3 conversion for VREFINT
+      HAL_ADC_Start(&hadc3);
+      if (HAL_ADC_PollForConversion(&hadc3, 100) == HAL_OK) {
+        uint32_t vrefint_raw = HAL_ADC_GetValue(&hadc3);
+
+        // Calculate VDDA from VREFINT reading
+        // VDDA = (VREFINT_CAL_VREF * VREFINT_CAL) / vrefint_raw
+        uint16_t vrefint_cal = *VREFINT_CAL_ADDR;
+        if (vrefint_raw > 0) {
+          vdda_mv = (uint16_t)((VREFINT_CAL_VREF * vrefint_cal) / vrefint_raw);
+        }
+      }
+      HAL_ADC_Stop(&hadc3);
+    }
 
     if (uart_tx_busy && huart3.gState == HAL_UART_STATE_READY) {
       uart_tx_busy = 0;
